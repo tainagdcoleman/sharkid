@@ -1,36 +1,17 @@
 import cv2
+import os
 import numpy as np 
-from pathlib import Path
-import math
-from functools import partial, reduce 
-import matplotlib.pyplot as plt
+import pathlib
+import math 
+import matplotlib.pyplot as plt 
 
 import argparse
-#comment here
 
 from typing import Tuple, Union, List, TypeVar, Optional
-Num = TypeVar('Num', int, float)
+from helpers import Num, Point, dist_to_line
 
-def magnitude(point: Tuple[Num, Num]) -> Num:
-    return math.sqrt(point[0]**2 + point[1]**2)
-
-def angle(point: Tuple[Num, Num], point0: Tuple[Num, Num], point1: Tuple[Num, Num]) -> float:
-    """Calculates angles between three points
-
-    Args:
-        point: midpoint
-        point0: first endpoint
-        point1: second endpoint
-
-    Returns:
-        angle between three points in radians
-    """
-    a = (point[0] - point0[0], point[1] - point0[1])
-    b = (point[0] - point1[0], point[1] - point1[1])
-
-    adotb = (a[0] * b[0] + a[1] * b[1])
-
-    return math.acos(adotb / (magnitude(a) * magnitude(b)))
+from functools import partial
+from multiprocessing import Pool 
 
 def find_points(img: 'cv2.Mat', 
                 kernel: int = 9, 
@@ -51,44 +32,22 @@ def find_points(img: 'cv2.Mat',
         point_idxs.append(idx)
     
     return sorted(point_idxs), contour, tri_points[np.argsort(point_idxs)]
-
-def find_coordinates(points: List[Tuple[int, int]])-> float:
+    
+def coord_transform(points: List[Tuple[int, int]])-> float:
     start_x, start_y = points[0] 
     end_x, end_y = points[-1]
-
     inner = points[1:-1]
 
-    dy = end_y - start_y
-    dx = end_x - start_x
-    m_dif = end_x*start_y - end_y*start_x
-    denom = math.sqrt(dy**2 + dx**2)
-    
-    ys = list(map(lambda point: (dy*point[0] - dx*point[1] + m_dif)/denom, inner))
+    perp_point_x = start_x - (end_y - start_y)
+    perp_point_y = start_y + (end_x - start_x)
 
-    dx, dy = -dy, dx
-    m_dif = (start_x + dx)*start_y - (start_y + dy)*start_x
-    denom = math.sqrt(dy**2 + dx**2)
-
-    xs = list(map(lambda point: (dy*point[0] - dx*point[1] + m_dif)/denom, inner))
+    ys = dist_to_line((start_x, start_y), (end_x, end_y), *inner, signed=True)
+    xs = dist_to_line((start_x, start_y), (perp_point_x, perp_point_y), *inner, signed=True)
 
     return xs, ys
 
-def find_dist_tri(endpoints, points: List[Tuple[int, int]])-> float:
-    start_x, start_y = endpoints[0]
-    end_x, end_y = endpoints[1]
-    mid_x, mid_y = points[len(points) // 2]
-    
-    dy = end_y - start_y
-    dx = end_x - start_x
-    m_dif = end_x*start_y - end_y*start_x
-    denom = math.sqrt(dy**2 + dx**2)
-    dist = abs(dy*mid_x - dx*mid_y + m_dif) / denom
-    return dist
-
-def find_angles(points: List[Tuple[int, int]])-> float:
-    return -angle(points[len(points) // 2], points[0], points[-1])
-
-def draw(points: List, 
+def draw(img: 'cv2.Mat',
+         points: List, 
          contour: List, 
          triangle: Optional[List] = None) -> None:
 
@@ -105,87 +64,110 @@ def draw(points: List,
             x1, y1 = triangle[(i+1)%len(triangle)][0]
             cv2.line(drawing, (x, y), (x1, y1), color=(0, 255, 255), thickness=5)
 
-    cv2.imshow('fin', drawing)
-    
-    if cv2.waitKey(0) == ord('n'):
-        return
+    return drawing 
 
-def increasing(xs, ys):
+def remove_decreasing(xs, ys):
     maxx = xs[0]
     for x, y in zip(xs, ys):
         if x > maxx:
             yield x, y
             maxx = x
 
-def plot_ridges(points:List[Tuple[int, int]]) -> None:
-    xs, ys = find_coordinates(points)
+def get_ridges(points: List[Point]) -> None:
+    xs, ys = coord_transform(points)
 
     # Get rid of bad points (x should be increasing)
-    xs, ys = map(np.asarray, zip(*increasing(xs, ys)))
+    xs, ys = map(np.asarray, zip(*remove_decreasing(xs, ys)))
 
     # normalize 
     xs = xs / np.absolute(xs).max()
     ys = ys / np.absolute(ys).max()
 
-    plt.plot(xs, ys)
-    plt.ylabel('some numbers')
-    plt.show()
+    return xs, ys 
+
+def process_image(mask_path: pathlib.Path, 
+                  outdir: pathlib.Path,
+                  do_debug: bool = False,
+                  do_draw: bool = False) -> None:
+    img = cv2.imread(str(mask_path))
+    point_idxs, contour, triangle = find_points(img)
+
+    contour_list = [tuple(elem[0]) for elem in contour]
+    partitions = []
+    for i in range(len(point_idxs)):
+        idx = point_idxs[i]
+        idx_next = point_idxs[(i+1) % len(point_idxs)]
+
+        if idx <= idx_next:
+            partitions.append(contour_list[idx:idx_next])
+        else:
+            partitions.append(contour_list[idx:] + contour_list[:idx_next])
+
+    max_dist = -1
+    ridges = None
+    for i in range(len(triangle)):
+        start = triangle[i][0]
+        end = triangle[(i+1)%len(triangle)][0]
+        mid = partitions[i][len(partitions[i]) // 2]
+        dist = dist_to_line(start, end, mid)
+        if max_dist < dist:
+            ridges = partitions[i]
+            max_dist = dist
+    
+    if max_dist <= 0:
+        print(f'Error with {mask_path}')
+        return
+
+    fig, (ax_im, ax_ridges) = plt.subplots(2, 1)
+    if do_debug:
+        detected_points = [ridges[0], ridges[-1]] + [p[len(p) // 2] for p in partitions]
+        drawing = draw(img, detected_points, contour, triangle)
+    else:
+        drawing = draw(img, [ridges[0], ridges[-1]], contour)
+
+    ax_im.imshow(drawing)
+
+    xs, ys = get_ridges(ridges)
+    ax_ridges.plot(xs, ys)
+
+    if do_draw:
+        fig.show()
+    
+    if outdir:
+        fig.savefig(f'{outdir.joinpath(mask_path.stem)}.png')
+    
+    plt.close(fig)
+
 
 if __name__ == '__main__':    
     parser = argparse.ArgumentParser()
     parser.add_argument(
         '--debug',
         action='store_true',
-        help='Set debug flag',
+        help='Set debug flag for plotting extra points',
     ) 
     parser.add_argument(
-        '--no-draw',
+        '--show',
         action='store_true',
-        help='Do not draw',
+        help='Display the output, one at a time',
+    ) 
+    parser.add_argument(
+        '--out',
+        default='out',
+        help='output directory',
     )
 
     args = parser.parse_args()
 
-    do_draw = not args.no_draw
-    do_debug = args.debug
+    outdir = pathlib.Path(args.out)
+    if outdir.is_file():
+        raise FileExistsError(f'{outdir} is a file. You should provide a directory.')
+    if not outdir.is_dir():
+        outdir.mkdir(parents=True, exist_ok=True)
 
-    file_path = Path(__file__).parent.absolute()
-    masks_path = Path(file_path, "Masks")
+    file_path = pathlib.Path(__file__).parent.absolute()
+    masks_path = pathlib.Path(file_path, "Masks")
 
-    if do_draw:
-        cv2.namedWindow(f'fin', cv2.WINDOW_NORMAL)
-
-    for mask_path in masks_path.glob('*.png'):
-        img = cv2.imread(str(mask_path))
-        point_idxs, contour, triangle = find_points(img)
-
-        partitions = []
-
-        contour_list = [tuple(elem[0]) for elem in contour]
-
-        for i in range(len(point_idxs)):
-            idx = point_idxs[i]
-            idx_next = point_idxs[(i+1) % len(point_idxs)]
-
-            if idx <= idx_next:
-                partitions.append(contour_list[idx:idx_next])
-            else:
-                partitions.append(contour_list[idx:] + contour_list[:idx_next])
-
-
-        tri_lines = ((tuple(triangle[i][0]), tuple(triangle[(i+1)%len(triangle)][0]))
-                     for i in range(len(triangle)))
-
-        idx_max = np.argmax(list(map(lambda args: find_dist_tri(*args), zip(tri_lines, partitions))))
-        detected_points = [partitions[idx_max][0], partitions[idx_max][-1]]
-
-        if do_draw:
-            if do_debug:
-                detected_points += [p[len(p) // 2] for p in partitions]
-                draw(detected_points, contour, triangle)
-            else:
-                draw(detected_points, contour)
-
-
-        plot_ridges(partitions[idx_max])
-        
+    pool = Pool(os.cpu_count())
+    process_func = partial(process_image, outdir=outdir, do_debug=args.debug, do_draw=args.show)
+    pool.map(partial(process_image, outdir=outdir), masks_path.glob('*.png'))

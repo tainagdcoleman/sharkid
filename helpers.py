@@ -1,4 +1,7 @@
-from typing import Tuple, List, Dict, TypeVar
+from typing import Tuple, List, Dict, TypeVar, Union
+import scipy.ndimage
+import numpy as np
+import math
 
 Num = TypeVar('Num', float, int)
 Point = Tuple[Num, Num]
@@ -75,3 +78,33 @@ def dist_to_line(start: Point, end: Point, *points: Point, signed=False) -> Unio
         return dist(points[0])
     else:
         return list(map(dist, points))
+
+def gaussian_filter(points:List[Point], sigma=0.3):
+    return scipy.ndimage.gaussian_filter(np.asarray(points), sigma)
+
+
+def distance(point1: Point, point2: Point):
+    x1, y1 = point1 
+    x2, y2 = point2 
+
+    return math.sqrt((x2 - x1)**2 + (y2 - y1)**2)
+
+def coord_transform(points: List[Tuple[int, int]])-> float:
+    start_x, start_y = points[0] 
+    end_x, end_y = points[-1]
+    inner = points[1:-1]
+
+    perp_point_x = start_x - (end_y - start_y)
+    perp_point_y = start_y + (end_x - start_x)
+
+    ys = dist_to_line((start_x, start_y), (end_x, end_y), *inner, signed=True)
+    xs = dist_to_line((start_x, start_y), (perp_point_x, perp_point_y), *inner, signed=True)
+
+    return xs, ys
+
+def remove_decreasing(xs, ys):
+    maxx = xs[0]
+    for x, y in zip(xs, ys):
+        if x > maxx:
+            yield x, y
+            maxx = x
